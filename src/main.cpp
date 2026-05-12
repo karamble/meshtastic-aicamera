@@ -210,13 +210,14 @@ static String class_label_for(int slot_id, int class_idx) {
   return String(coco_name(class_idx));
 }
 
-// Boot-time STATUS frame, latched in loop() after BLE handshake completes.
-// Format matches diginode-cc's parser (Mode/Scan/Hits/Temp/Up are required
-// in this order); Type/Slots/Model are camera-specific tail tokens the
-// regex ignores. Mirrors the gatesensor sibling's ARMED frame.
+// STATUS frame in the gatesensor/halberd family format, matching
+// diginode-cc's parser (Mode/Scan/Hits/Temp/Up are required in this order);
+// Type/Slots/Model are camera-specific tail tokens the regex ignores.
+// Same frame on boot (latched once via sent_armed in loop()) and on demand
+// (via on_mesh_text() when an @ALL/@CAM/@<shortname> STATUS arrives).
 static bool sent_armed = false;
 
-static void send_armed_status() {
+static bool send_status_frame() {
   uint32_t s_total = millis() / 1000UL;
   unsigned h   = (unsigned)(s_total / 3600UL);
   unsigned m   = (unsigned)((s_total / 60UL) % 60UL);
@@ -231,9 +232,45 @@ static void send_armed_status() {
     "Up:%02u:%02u:%02u Type:AICAMERA Slots:%u Model:%s",
     h, m, sec, (unsigned)g_slots.size(), alias);
 
-  if (mesh.send_text(buf)) {
-    sent_armed = true;
-    Serial.printf("mesh: ARMED queued (%s)\n", buf);
+  bool ok = mesh.send_text(buf);
+  Serial.printf("mesh: STATUS %s (%s)\n", ok ? "queued" : "DROPPED", buf);
+  return ok;
+}
+
+// Inbound text dispatcher. Targets are matched case-insensitively against
+// "ALL", "CAM", and our discovered Meshtastic short name. Currently the only
+// supported verb is STATUS → re-emit the same frame we send on boot.
+static void on_mesh_text(const char *text, uint32_t from) {
+  Serial.printf("mesh-rx: from=%08x text='%s'\n", (unsigned)from, text);
+  if (text[0] != '@') return;
+  const char *sp = strchr(text, ' ');
+  if (!sp) return;
+
+  size_t tlen = (size_t)(sp - (text + 1));
+  if (tlen == 0 || tlen >= 24) return;
+  char target[24] = {0};
+  memcpy(target, text + 1, tlen);
+
+  bool match = false;
+  if      (strcasecmp(target, "ALL") == 0) match = true;
+  else if (strcasecmp(target, "CAM") == 0) match = true;
+  else {
+    const char *sn = mesh.short_name();
+    if (sn[0] && strcasecmp(target, sn) == 0) match = true;
+  }
+  if (!match) return;
+
+  const char *v = sp + 1;
+  while (*v == ' ') ++v;
+  char verb[16] = {0};
+  size_t i = 0;
+  while (v[i] && v[i] != ' ' && i < sizeof(verb) - 1) { verb[i] = v[i]; ++i; }
+
+  if (strcasecmp(verb, "STATUS") == 0) {
+    Serial.printf("mesh-rx: @%s STATUS -> responding\n", target);
+    send_status_frame();
+  } else {
+    Serial.printf("mesh-rx: @%s %s -> unknown verb (ignored)\n", target, verb);
   }
 }
 
@@ -256,6 +293,7 @@ static void print_help() {
     "  watch on|off       continuous-invoke + forward detections to mesh\n"
     "  mesh-status        show BLE state (scanning/pairing/ready/...)\n"
     "  mesh-test <text>   broadcast a one-off text over the mesh\n"
+    "  whoami             print the discovered Meshtastic short/long name + num\n"
     "  ble-pin            show the current BLE pairing PIN (from NVS)\n"
     "  ble-pin <N>        store new BLE PIN in NVS and reboot (1..999999)\n"
     "  grove-show         print the per-slot model alias + class metadata\n"
@@ -292,6 +330,7 @@ void setup() {
   Serial.printf("BLE PIN: %u (from NVS, default %u)\n",
                 (unsigned)ble_pin, (unsigned)kBlePinDefault);
   mesh.begin("aicam-bridge", ble_pin, /*peer_name=*/"cam_");
+  mesh.set_text_handler(on_mesh_text);
   Serial.println("mesh: BLE central started, scanning for Meshtastic 'cam_*' peer...");
 
   load_grove_slots();
@@ -346,7 +385,9 @@ static void watch_tick() {
 
 void loop() {
   mesh.loop();           // BLE state machine
-  if (!sent_armed && mesh.is_connected()) send_armed_status();
+  if (!sent_armed && mesh.is_connected()) {
+    if (send_status_frame()) sent_armed = true;
+  }
   drain_responses(0);    // SSCMA spontaneous events
   if (watch_enabled && (millis() - last_invoke_ms) >= kInvokePeriodMs) {
     last_invoke_ms = millis();
@@ -484,6 +525,14 @@ void loop() {
         Serial.printf("mesh: state=%s connected=%s\n",
                       mesh.state_name(),
                       mesh.is_connected() ? "yes" : "no");
+      }
+      else if (cmd == "whoami") {
+        const char *sn = mesh.short_name();
+        const char *ln = mesh.long_name();
+        Serial.printf("identity: short='%s' long='%s' num=%u\n",
+                      sn[0] ? sn : "(unknown)",
+                      ln[0] ? ln : "(unknown)",
+                      (unsigned)mesh.my_node_num());
       }
       else if (cmd == "mesh-test") {
         if (!arg.length()) { Serial.println("usage: mesh-test <text>"); }

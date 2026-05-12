@@ -12,6 +12,10 @@
 #include <Arduino.h>
 #include <stdint.h>
 
+// Invoked from MeshBLE::loop() (main task) when a TEXT_MESSAGE_APP frame is
+// decoded. `text` points into a transient stack buffer; copy if needed.
+typedef void (*MeshTextCb)(const char *text, uint32_t from_node);
+
 class MeshBLE {
 public:
   enum State : uint8_t {
@@ -42,6 +46,16 @@ public:
   // Encode `text` as a TEXT_MESSAGE_APP broadcast on channel 0 and write
   // it to ToRadio. Returns false if not READY or handshake not complete.
   bool send_text(const char *text);
+
+  // Register a callback for inbound TEXT_MESSAGE_APP frames. Pass nullptr to
+  // disable. Callback runs in the main task from MeshBLE::loop().
+  void set_text_handler(MeshTextCb cb);
+
+  // Identity learned from the post-handshake config dump. Empty / 0 until
+  // the node sends our own NodeInfo (typically within ~5 s of READY).
+  const char *short_name() const;
+  const char *long_name()  const;
+  uint32_t    my_node_num() const;
 
 private:
   State    _state           = IDLE;

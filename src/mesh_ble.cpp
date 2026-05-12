@@ -34,6 +34,16 @@ static char                      s_name_filter[32] = {0};
 static uint32_t                  s_handshake_nonce    = 0;
 static volatile bool             s_handshake_complete = false;
 
+// Identity learned from the post-handshake config dump (MyNodeInfo +
+// NodeInfo with num == my_node_num). Used to match inbound `@<shortname>`.
+static uint32_t                  s_my_node_num   = 0;
+static char                      s_short_name[16] = {0};
+static char                      s_long_name [40] = {0};
+static bool                      s_identity_logged = false;
+
+// Inbound text dispatcher set by main.cpp.
+static MeshTextCb                s_text_cb = nullptr;
+
 // Hand-rolled minimal protobuf encoder.
 // Wire type: 0=varint, 1=64bit, 2=length-delim, 5=32bit. tag=(field<<3)|wire.
 
@@ -95,56 +105,201 @@ static size_t encode_want_config_id(uint32_t nonce, uint8_t *out, size_t out_max
   return encode_varint_field(3, nonce, out, out_max);  // field 3, uint32 varint
 }
 
-// Walk a FromRadio packet, return true on FromRadio.config_complete_id == nonce
-// (field 7, uint32 varint). Skips unknown top-level fields by wire type.
-static bool from_radio_has_config_complete(const uint8_t *buf, size_t len, uint32_t nonce) {
-  size_t i = 0;
-  while (i < len) {
-    uint64_t tag = 0;
-    int shift = 0;
-    while (i < len) {
-      uint8_t b = buf[i++];
-      tag |= ((uint64_t)(b & 0x7f)) << shift;
-      if (!(b & 0x80)) break;
-      shift += 7;
-      if (shift > 63) return false;
-    }
-    uint32_t field = (uint32_t)(tag >> 3);
-    uint32_t wire  = (uint32_t)(tag & 7);
+// ── Inbound protobuf decoder ────────────────────────────────────────────────
+// Hand-rolled, mirroring the encoder above. All readers advance `p` on
+// success and return false (without committing partial reads) on truncation
+// or malformed wire data.
 
-    if (field == 7 && wire == 0) {
-      uint64_t v = 0; int s = 0;
-      while (i < len) {
-        uint8_t b = buf[i++];
-        v |= ((uint64_t)(b & 0x7f)) << s;
-        if (!(b & 0x80)) break;
-        s += 7;
-        if (s > 63) return false;
-      }
-      return (uint32_t)v == nonce;
-    }
-
-    switch (wire) {
-      case 0: while (i < len && (buf[i++] & 0x80)) { } break;
-      case 1: i += 8; break;
-      case 5: i += 4; break;
-      case 2: {
-        uint64_t l = 0; int s = 0;
-        while (i < len) {
-          uint8_t b = buf[i++];
-          l |= ((uint64_t)(b & 0x7f)) << s;
-          if (!(b & 0x80)) break;
-          s += 7;
-          if (s > 63) return false;
-        }
-        if (i + l > len) return false;
-        i += (size_t)l;
-        break;
-      }
-      default: return false;
-    }
+static bool pb_read_varint(const uint8_t *&p, const uint8_t *end, uint64_t &v) {
+  v = 0; int shift = 0;
+  while (p < end) {
+    uint8_t b = *p++;
+    v |= ((uint64_t)(b & 0x7f)) << shift;
+    if (!(b & 0x80)) return true;
+    shift += 7;
+    if (shift > 63) return false;
   }
   return false;
+}
+
+static bool pb_read_fixed32(const uint8_t *&p, const uint8_t *end, uint32_t &v) {
+  if (end - p < 4) return false;
+  v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+      ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+  p += 4;
+  return true;
+}
+
+// Skip a single field's payload given its wire type. Used for fields we
+// don't care about. Returns false on truncation.
+static bool pb_skip(const uint8_t *&p, const uint8_t *end, uint8_t wire) {
+  switch (wire) {
+    case 0: { uint64_t v; return pb_read_varint(p, end, v); }
+    case 1: if (end - p < 8) return false; p += 8; return true;
+    case 5: if (end - p < 4) return false; p += 4; return true;
+    case 2: {
+      uint64_t l;
+      if (!pb_read_varint(p, end, l)) return false;
+      if ((uint64_t)(end - p) < l) return false;
+      p += (size_t)l;
+      return true;
+    }
+    default: return false;
+  }
+}
+
+// Copy a length-delimited string field into a fixed-size C buffer, NUL-
+// terminated, truncating if needed.
+static void pb_copy_string(const uint8_t *p, size_t n, char *out, size_t out_max) {
+  if (out_max == 0) return;
+  size_t copy = n < out_max - 1 ? n : out_max - 1;
+  memcpy(out, p, copy);
+  out[copy] = 0;
+}
+
+// User { string id=1, string long_name=2, string short_name=3, ... }
+static void parse_user(const uint8_t *p, size_t n,
+                       char *short_out, size_t short_max,
+                       char *long_out,  size_t long_max) {
+  const uint8_t *end = p + n;
+  while (p < end) {
+    uint64_t tag;
+    if (!pb_read_varint(p, end, tag)) return;
+    uint32_t field = (uint32_t)(tag >> 3);
+    uint8_t  wire  = (uint8_t)(tag & 7);
+    if (wire == 2) {
+      uint64_t l;
+      if (!pb_read_varint(p, end, l) || (uint64_t)(end - p) < l) return;
+      if      (field == 2) pb_copy_string(p, (size_t)l, long_out,  long_max);
+      else if (field == 3) pb_copy_string(p, (size_t)l, short_out, short_max);
+      p += (size_t)l;
+    } else if (!pb_skip(p, end, wire)) {
+      return;
+    }
+  }
+}
+
+// NodeInfo { uint32 num=1, User user=2, ... }
+// If `num` matches our my_node_num, decode the embedded User into s_short_name
+// / s_long_name and log the discovered identity once.
+static void parse_node_info(const uint8_t *p, size_t n) {
+  const uint8_t *end = p + n;
+  uint32_t num = 0;
+  const uint8_t *user_p = nullptr;
+  size_t user_len = 0;
+  while (p < end) {
+    uint64_t tag;
+    if (!pb_read_varint(p, end, tag)) return;
+    uint32_t field = (uint32_t)(tag >> 3);
+    uint8_t  wire  = (uint8_t)(tag & 7);
+    if (field == 1 && wire == 0) {
+      uint64_t v;
+      if (!pb_read_varint(p, end, v)) return;
+      num = (uint32_t)v;
+    } else if (field == 2 && wire == 2) {
+      uint64_t l;
+      if (!pb_read_varint(p, end, l) || (uint64_t)(end - p) < l) return;
+      user_p = p;
+      user_len = (size_t)l;
+      p += (size_t)l;
+    } else if (!pb_skip(p, end, wire)) {
+      return;
+    }
+  }
+  if (num != 0 && num == s_my_node_num && user_p) {
+    parse_user(user_p, user_len,
+               s_short_name, sizeof(s_short_name),
+               s_long_name,  sizeof(s_long_name));
+    if (!s_identity_logged) {
+      s_identity_logged = true;
+      log_i("mesh: identity short='%s' long='%s' num=%u",
+            s_short_name, s_long_name, (unsigned)s_my_node_num);
+    }
+  }
+}
+
+// MyNodeInfo { uint32 my_node_num=1, ... }
+static void parse_my_info(const uint8_t *p, size_t n) {
+  const uint8_t *end = p + n;
+  while (p < end) {
+    uint64_t tag;
+    if (!pb_read_varint(p, end, tag)) return;
+    uint32_t field = (uint32_t)(tag >> 3);
+    uint8_t  wire  = (uint8_t)(tag & 7);
+    if (field == 1 && wire == 0) {
+      uint64_t v;
+      if (!pb_read_varint(p, end, v)) return;
+      s_my_node_num = (uint32_t)v;
+    } else if (!pb_skip(p, end, wire)) {
+      return;
+    }
+  }
+}
+
+// Data { PortNum portnum=1 (varint), bytes payload=2, ... }
+// If portnum == TEXT_MESSAGE_APP (=1), copy payload to a stack buffer,
+// NUL-terminate, and dispatch to s_text_cb.
+static void parse_data(const uint8_t *p, size_t n, uint32_t from) {
+  const uint8_t *end = p + n;
+  uint32_t portnum = 0;
+  const uint8_t *payload_p = nullptr;
+  size_t payload_len = 0;
+  while (p < end) {
+    uint64_t tag;
+    if (!pb_read_varint(p, end, tag)) return;
+    uint32_t field = (uint32_t)(tag >> 3);
+    uint8_t  wire  = (uint8_t)(tag & 7);
+    if (field == 1 && wire == 0) {
+      uint64_t v;
+      if (!pb_read_varint(p, end, v)) return;
+      portnum = (uint32_t)v;
+    } else if (field == 2 && wire == 2) {
+      uint64_t l;
+      if (!pb_read_varint(p, end, l) || (uint64_t)(end - p) < l) return;
+      payload_p = p;
+      payload_len = (size_t)l;
+      p += (size_t)l;
+    } else if (!pb_skip(p, end, wire)) {
+      return;
+    }
+  }
+  if (portnum != 1 || !payload_p || !s_text_cb) return;
+  char buf[232];
+  size_t copy = payload_len < sizeof(buf) - 1 ? payload_len : sizeof(buf) - 1;
+  memcpy(buf, payload_p, copy);
+  buf[copy] = 0;
+  if (payload_len > copy) {
+    log_w("mesh: text payload truncated %u -> %u",
+          (unsigned)payload_len, (unsigned)copy);
+  }
+  s_text_cb(buf, from);
+}
+
+// MeshPacket { fixed32 from=1, fixed32 to=2, varint channel=3, Data decoded=4,
+//              fixed32 id=6, ... }
+static void parse_mesh_packet(const uint8_t *p, size_t n) {
+  const uint8_t *end = p + n;
+  uint32_t from = 0;
+  const uint8_t *decoded_p = nullptr;
+  size_t decoded_len = 0;
+  while (p < end) {
+    uint64_t tag;
+    if (!pb_read_varint(p, end, tag)) return;
+    uint32_t field = (uint32_t)(tag >> 3);
+    uint8_t  wire  = (uint8_t)(tag & 7);
+    if (field == 1 && wire == 5) {
+      if (!pb_read_fixed32(p, end, from)) return;
+    } else if (field == 4 && wire == 2) {
+      uint64_t l;
+      if (!pb_read_varint(p, end, l) || (uint64_t)(end - p) < l) return;
+      decoded_p = p;
+      decoded_len = (size_t)l;
+      p += (size_t)l;
+    } else if (!pb_skip(p, end, wire)) {
+      return;
+    }
+  }
+  if (decoded_p) parse_data(decoded_p, decoded_len, from);
 }
 
 size_t MeshBLE::encode_text_to_radio(const char *text, uint8_t *out, size_t out_max) {
@@ -247,9 +402,10 @@ static void from_num_notify(NimBLERemoteCharacteristic *,
   log_d("mesh: FromNum notify %zu bytes", len);
 }
 
-// Read FromRadio until empty, watching for the handshake config_complete_id.
-// (queue exhausted), parsing each protobuf-encoded FromRadio message for the
-// config_complete_id marker that ends the want_config handshake.
+// Read FromRadio until empty. Dispatches on the top-level FromRadio oneof
+// tag: handshake sentinel (field 7), inbound MeshPacket (field 2), MyNodeInfo
+// (field 3), NodeInfo (field 4). Other variants (config, log_record, ...) are
+// skipped.
 static void drain_from_radio() {
   if (!s_from_radio) return;
   for (int i = 0; i < 256; ++i) {          // generous cap; Meshtastic config dumps can be 50+ packets
@@ -257,10 +413,33 @@ static void drain_from_radio() {
     size_t len = val.length();
     if (len == 0) break;                   // queue empty
     log_d("mesh: FromRadio rx len=%u", (unsigned)len);
-    if (!s_handshake_complete && s_handshake_nonce != 0) {
-      if (from_radio_has_config_complete(val.data(), len, s_handshake_nonce)) {
-        s_handshake_complete = true;
-        log_i("mesh: handshake config_complete_id=%u matched", (unsigned)s_handshake_nonce);
+    const uint8_t *p = val.data(), *end = p + len;
+    while (p < end) {
+      uint64_t tag;
+      if (!pb_read_varint(p, end, tag)) break;
+      uint32_t field = (uint32_t)(tag >> 3);
+      uint8_t  wire  = (uint8_t)(tag & 7);
+      if (wire == 2) {
+        uint64_t sub_len;
+        if (!pb_read_varint(p, end, sub_len) || (uint64_t)(end - p) < sub_len) break;
+        const uint8_t *sub = p;
+        p += (size_t)sub_len;
+        switch (field) {
+          case 2: parse_mesh_packet(sub, (size_t)sub_len); break;
+          case 3: parse_my_info   (sub, (size_t)sub_len); break;
+          case 4: parse_node_info (sub, (size_t)sub_len); break;
+          default: break;
+        }
+      } else if (wire == 0 && field == 7) {
+        uint64_t cci;
+        if (!pb_read_varint(p, end, cci)) break;
+        if (!s_handshake_complete && s_handshake_nonce != 0 &&
+            (uint32_t)cci == s_handshake_nonce) {
+          s_handshake_complete = true;
+          log_i("mesh: handshake config_complete_id=%u matched", (unsigned)cci);
+        }
+      } else {
+        if (!pb_skip(p, end, wire)) break;
       }
     }
   }
@@ -320,6 +499,10 @@ void MeshBLE::loop() {
     s_handshake_nonce   = 0;
     s_handshake_complete= false;
     s_data_pending      = false;
+    s_my_node_num       = 0;
+    s_short_name[0]     = 0;
+    s_long_name[0]      = 0;
+    s_identity_logged   = false;
     _handshake_sent     = false;
     _handshake_complete = false;
     _state              = DISCONNECTED;
@@ -452,3 +635,8 @@ bool MeshBLE::send_text(const char *text) {
   else     log_i("mesh: sent '%s' (%u bytes)", text, (unsigned)n);
   return ok;
 }
+
+void MeshBLE::set_text_handler(MeshTextCb cb) { s_text_cb = cb; }
+const char *MeshBLE::short_name() const { return s_short_name; }
+const char *MeshBLE::long_name()  const { return s_long_name;  }
+uint32_t    MeshBLE::my_node_num() const { return s_my_node_num; }
