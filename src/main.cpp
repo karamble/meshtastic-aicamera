@@ -280,6 +280,34 @@ static bool send_status_frame() {
   return ok;
 }
 
+// MODEL_LIST response: compact id=alias[*] tokens, '*' marks the bound slot.
+// "Cam: MODELS:1=person*,2=face,..." or "Cam: MODELS:NONE". diginode-cc's
+// textparser.handleAIModels parses this and synthesizes MODEL_LIST_ACK,
+// mirroring CODE_LIST / CODES: in gatesensor.
+static void send_model_list() {
+  char buf[224];
+  int off = snprintf(buf, sizeof(buf), "Cam: MODELS:");
+
+  if (g_slots.empty()) {
+    snprintf(buf + off, sizeof(buf) - off, "NONE");
+  } else {
+    bool first = true;
+    for (auto &s : g_slots) {
+      if (off >= (int)sizeof(buf) - 24) break;  // leave tail margin
+      off += snprintf(buf + off, sizeof(buf) - off,
+                      "%s%d=%s%s",
+                      first ? "" : ",",
+                      s.id,
+                      s.alias.c_str(),
+                      s.id == g_current_slot ? "*" : "");
+      first = false;
+    }
+  }
+
+  bool ok = mesh.send_text(buf);
+  Serial.printf("mesh: MODELS %s (%s)\n", ok ? "queued" : "DROPPED", buf);
+}
+
 // State transitions shared by the mesh dispatcher and the local `watch` REPL
 // command. AT+BREAK halts any pending invoke on the WE-2 (idempotent); the
 // watch_enabled flag gates watch_tick() in loop().
@@ -374,6 +402,9 @@ static void on_mesh_text(const char *text, uint32_t from) {
       mesh.send_text("Cam: HB_ACK:OK");
       Serial.printf("hb: interval=%umin [mesh]\n", (unsigned)hb_interval_min);
     }
+  } else if (strcasecmp(verb, "MODEL_LIST") == 0) {
+    Serial.printf("mesh-rx: @%s MODEL_LIST -> responding\n", target);
+    send_model_list();
   } else {
     Serial.printf("mesh-rx: @%s %s -> unknown verb (ignored)\n", target, verb);
   }
