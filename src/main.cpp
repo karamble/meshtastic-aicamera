@@ -7,7 +7,9 @@
 #include <Preferences.h>
 #include <vector>
 
+#include "bridge_actions.h"
 #include "mesh_ble.h"
+#include "webui.h"
 
 SSCMA    AI;
 MeshBLE  mesh;
@@ -415,6 +417,70 @@ static bool bind_slot(int id, const char *source) {
   return true;
 }
 
+// ---- bridge:: action surface (consumed by webui.cpp) ---------------------
+// Thin wrappers around the camera-bridge state above. Defined here so the
+// existing helpers (bind_slot, arm/disarm, store_*) and statics (g_slots,
+// conf_min, cooldown_ms, hb_*) are all already in scope.
+
+size_t      bridge::slot_count()        { return g_slots.size(); }
+UiSlot      bridge::slot_at(size_t idx) {
+  const GroveSlot &s = g_slots[idx];
+  return UiSlot{ s.id, s.alias.c_str(), s.id == g_current_slot };
+}
+int         bridge::current_slot()      { return g_current_slot; }
+uint8_t     bridge::conf_min()          { return ::conf_min; }
+uint16_t    bridge::dedup_sec()         { return (uint16_t)(cooldown_ms / 1000UL); }
+bool        bridge::hb_enabled()        { return ::hb_enabled; }
+uint8_t     bridge::hb_interval_min()   { return ::hb_interval_min; }
+bool        bridge::armed()             { return watch_enabled; }
+const char *bridge::mesh_short_name()   { return mesh.short_name(); }
+bool        bridge::mesh_connected()    { return mesh.is_connected(); }
+uint32_t    bridge::uptime_ms()         { return millis(); }
+
+bool bridge::set_model(int id) {
+  return bind_slot(id, "web");
+}
+
+bool bridge::set_conf(int v) {
+  if (v < kConfMinAbsMin || v > kConfMinAbsMax) return false;
+  ::conf_min = (uint8_t)v;
+  store_conf_min(::conf_min);
+  Serial.printf("conf: threshold=%u [web]\n", (unsigned)::conf_min);
+  return true;
+}
+
+bool bridge::set_dedup_sec(int v) {
+  if (v < kDedupSecMin || v > kDedupSecMax) return false;
+  cooldown_ms = (uint32_t)v * 1000UL;
+  store_dedup_sec((uint16_t)v);
+  for (uint32_t &t : last_fired_ms) t = 0;
+  Serial.printf("dedup: interval=%us [web]\n", (unsigned)v);
+  return true;
+}
+
+bool bridge::set_hb_enabled(bool on) {
+  ::hb_enabled = on;
+  hb_last_send_ms = millis();
+  store_hb_enabled(on);
+  Serial.printf("hb: %s [web]\n", on ? "ON" : "OFF");
+  return true;
+}
+
+bool bridge::set_hb_interval(int min) {
+  if (min < kHbMinMin || min > kHbMinMax) return false;
+  ::hb_interval_min = (uint8_t)min;
+  hb_last_send_ms = millis();
+  store_hb_interval(::hb_interval_min);
+  Serial.printf("hb: interval=%umin [web]\n", (unsigned)::hb_interval_min);
+  return true;
+}
+
+bool bridge::set_armed(bool on) {
+  if (on) arm_camera("web");
+  else    disarm_camera("web");
+  return true;
+}
+
 // Inbound text dispatcher. Targets matched case-insensitively against "ALL",
 // "CAM", and our discovered Meshtastic short name. Global verbs handled here:
 // STATUS, START, STOP. Cam-specific verbs come later.
@@ -441,7 +507,10 @@ static void on_mesh_text(const char *text, uint32_t from) {
   const char *v = sp + 1;
   while (*v == ' ') ++v;
   char verb[24]   = {0};
-  char vparam[16] = {0};
+  // 64 bytes fits a 63-char WPA2 PSK (the largest string-shaped param any
+  // verb accepts). Numeric-param verbs are unaffected: atoi() stops at the
+  // first non-digit either way.
+  char vparam[64] = {0};
   size_t i = 0;
   while (v[i] && v[i] != ' ' && v[i] != ':' && i < sizeof(verb) - 1) {
     verb[i] = v[i]; ++i;
@@ -449,8 +518,14 @@ static void on_mesh_text(const char *text, uint32_t from) {
   if (v[i] == ':') {
     ++i;
     size_t j = 0;
-    while (v[i] && v[i] != ' ' && j < sizeof(vparam) - 1) {
+    // Param extends to end of string (no space-terminator) so WIFI_SSID /
+    // WIFI_PSK can carry spaces. Trim trailing whitespace afterwards.
+    while (v[i] && j < sizeof(vparam) - 1) {
       vparam[j++] = v[i++];
+    }
+    while (j > 0 && (vparam[j-1] == ' ' || vparam[j-1] == '\t' ||
+                     vparam[j-1] == '\r' || vparam[j-1] == '\n')) {
+      vparam[--j] = '\0';
     }
   }
 
@@ -531,6 +606,30 @@ static void on_mesh_text(const char *text, uint32_t from) {
       mesh.send_text("Cam: CONF_ACK:OK");
       Serial.printf("conf: threshold=%u [mesh]\n", (unsigned)conf_min);
     }
+  } else if (strcasecmp(verb, "WIFI_ON") == 0) {
+    bool ok = webui.turn_on();
+    mesh.send_text(ok ? "Cam: WIFI_ACK:OK" : "Cam: WIFI_ACK:ERROR");
+    Serial.printf("wifi: %s [mesh]\n", ok ? "ON" : "FAIL");
+  } else if (strcasecmp(verb, "WIFI_OFF") == 0) {
+    webui.turn_off();
+    mesh.send_text("Cam: WIFI_ACK:OK");
+    Serial.println("wifi: OFF [mesh]");
+  } else if (strcasecmp(verb, "WIFI_SSID") == 0) {
+    if (webui.set_ssid(String(vparam))) {
+      mesh.send_text("Cam: WIFI_SSID_ACK:OK");
+      Serial.printf("wifi: ssid stored '%s' (cycle WIFI_OFF/ON to apply) [mesh]\n", vparam);
+    } else {
+      mesh.send_text("Cam: WIFI_SSID_ACK:ERROR");
+      Serial.printf("wifi: bad ssid (must be 1..32 chars) [mesh]\n");
+    }
+  } else if (strcasecmp(verb, "WIFI_PSK") == 0) {
+    if (webui.set_psk(String(vparam))) {
+      mesh.send_text("Cam: WIFI_PSK_ACK:OK");
+      Serial.printf("wifi: psk stored (cycle WIFI_OFF/ON to apply) [mesh]\n");
+    } else {
+      mesh.send_text("Cam: WIFI_PSK_ACK:ERROR");
+      Serial.printf("wifi: bad psk (WPA2 requires 8..63 chars) [mesh]\n");
+    }
   } else {
     Serial.printf("mesh-rx: @%s %s -> unknown verb (ignored)\n", target, verb);
   }
@@ -559,6 +658,9 @@ static void print_help() {
     "  whoami             print the discovered Meshtastic short/long name + num\n"
     "  ble-pin            show the current BLE pairing PIN (from NVS)\n"
     "  ble-pin <N>        store new BLE PIN in NVS and reboot (1..999999)\n"
+    "  wifi [on|off]      softAP + web console at 192.168.4.1 (no arg = status)\n"
+    "  wifi-ssid <name>   SSID for the operator hotspot (1..32 chars)\n"
+    "  wifi-psk <pass>    WPA2 PSK for the operator hotspot (8..63 chars)\n"
     "  grove-show         print the per-slot model alias + class metadata\n"
     "  grove-set <n> <alias> <class1|class2|...>   write one slot to NVS\n"
     "  grove-reset        clear all per-slot metadata from NVS\n"
@@ -617,6 +719,10 @@ void setup() {
     Serial.println("auto: bound model 1, algo=0 (firmware auto-detect)");
   }
 
+  // Wi-Fi softAP last — NimBLE central is already up and BLE/Wi-Fi
+  // coexistence prefers the BLE link to be established first.
+  webui.begin();
+
   print_help();
   Serial.print("ai> ");
 }
@@ -654,6 +760,7 @@ static void watch_tick() {
 
 void loop() {
   mesh.loop();           // BLE state machine
+  webui.tick();          // DNS + HTTP, cheap when AP is off
   if (!sent_armed && mesh.is_connected()) {
     if (send_status_frame()) {
       sent_armed = true;
@@ -857,6 +964,50 @@ void loop() {
             delay(200);
             ESP.restart();
           }
+        }
+      }
+      else if (cmd == "wifi") {
+        if (arg.length() == 0) {
+          Serial.printf("wifi: %s ssid='%s' psk='%s' clients=%u\n",
+                        webui.is_on() ? "ON" : "OFF",
+                        webui.ssid().c_str(), webui.psk().c_str(),
+                        (unsigned)webui.client_count());
+          if (webui.is_on()) {
+            Serial.printf("wifi: open http://192.168.4.1/ to access the operator console\n");
+          }
+        } else if (arg.equalsIgnoreCase("on") || arg == "1") {
+          if (webui.turn_on()) {
+            Serial.printf("wifi: ON (ssid='%s' ip=192.168.4.1) [repl]\n",
+                          webui.ssid().c_str());
+          } else {
+            Serial.println("wifi: turn_on FAILED");
+          }
+        } else if (arg.equalsIgnoreCase("off") || arg == "0") {
+          webui.turn_off();
+          Serial.println("wifi: OFF [repl]");
+        } else {
+          Serial.println("usage: wifi [on|off]   (no arg = show status)");
+        }
+      }
+      else if (cmd == "wifi-ssid") {
+        if (!arg.length()) {
+          Serial.printf("wifi-ssid: current='%s' (length %u..%u)\n",
+                        webui.ssid().c_str(), 1u, 32u);
+        } else if (!webui.set_ssid(arg)) {
+          Serial.println("wifi-ssid: rejected (must be 1..32 chars)");
+        } else {
+          Serial.printf("wifi-ssid: stored '%s' (takes effect on next `wifi off`/`wifi on`)\n",
+                        arg.c_str());
+        }
+      }
+      else if (cmd == "wifi-psk") {
+        if (!arg.length()) {
+          Serial.printf("wifi-psk: current='%s' (WPA2 requires 8..63 chars)\n",
+                        webui.psk().c_str());
+        } else if (!webui.set_psk(arg)) {
+          Serial.println("wifi-psk: rejected (WPA2 requires 8..63 chars)");
+        } else {
+          Serial.printf("wifi-psk: stored (takes effect on next `wifi off`/`wifi on`)\n");
         }
       }
       else if (cmd == "scan") {

@@ -51,7 +51,7 @@ Then configure the Meshtastic node from the Meshtastic Android/iOS app per `docs
 ## Documentation
 
 - `docs/PROJECT_OVERVIEW.md` - architecture and data flow
-- `docs/CAMERA_SUBSYSTEM_USER.md` - bring up the Grove Vision AI V2
+- `docs/CAMERA_SUBSYSTEM_USER.md` - bring up the Grove Vision AI V2, plus the full runtime reference (mesh verbs, Wi-Fi operator console, USB REPL)
 - `docs/CAMERA_SUBSYSTEM_TECHNICAL.md` - WE-2 protocol and flash layout reference
 - `docs/MESHTASTIC_NODE_USER.md` - configure the Meshtastic node via the mobile app
 

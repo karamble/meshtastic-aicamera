@@ -122,3 +122,9 @@ make mesh-info
 Confirms identity, region, and channel-0 PSK from the dev machine's view of the node.
 
 From any other Meshtastic device on the fleet, the Nodes screen shows a new entry `aicam` (`cam_xxxx`) with a recent Last Heard. When the bridge is also powered, the primary-channel chat shows `@CAM bridge online` followed by `@CAM TRIGGERED:<class>@<score>` lines for each detection.
+
+## Controlling the bridge over the mesh
+
+The bridge listens for text frames addressed to `@CAM` (or `@ALL`, or its discovered short name) and responds with `Cam: ...` replies on the same channel. You can ask it for its current state, switch models, change confidence and dedup thresholds, toggle heartbeats, and bring up an on-demand Wi-Fi console for local web access — all from any peer on the fleet.
+
+See `CAMERA_SUBSYSTEM_USER.md` &rarr; *Mesh verbs* for the full verb reference and reply formats.
