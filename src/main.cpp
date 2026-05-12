@@ -215,6 +215,7 @@ static String class_label_for(int slot_id, int class_idx) {
 // Type/Slots/Model are camera-specific tail tokens the regex ignores.
 // Same frame on boot (latched once via sent_armed in loop()) and on demand
 // (via on_mesh_text() when an @ALL/@CAM/@<shortname> STATUS arrives).
+// Mode flips ARMED <-> DISARMED based on watch_enabled.
 static bool sent_armed = false;
 
 static bool send_status_frame() {
@@ -225,21 +226,39 @@ static bool send_status_frame() {
 
   const GroveSlot *cur = slot_by_id(g_current_slot);
   const char *alias = cur ? cur->alias.c_str() : "?";
+  const char *mode  = watch_enabled ? "ARMED" : "DISARMED";
 
   char buf[128];
   snprintf(buf, sizeof(buf),
-    "Cam: STATUS: Mode:ARMED Scan:CAM Hits:0 Temp:0.0C "
+    "Cam: STATUS: Mode:%s Scan:CAM Hits:0 Temp:0.0C "
     "Up:%02u:%02u:%02u Type:AICAMERA Slots:%u Model:%s",
-    h, m, sec, (unsigned)g_slots.size(), alias);
+    mode, h, m, sec, (unsigned)g_slots.size(), alias);
 
   bool ok = mesh.send_text(buf);
   Serial.printf("mesh: STATUS %s (%s)\n", ok ? "queued" : "DROPPED", buf);
   return ok;
 }
 
-// Inbound text dispatcher. Targets are matched case-insensitively against
-// "ALL", "CAM", and our discovered Meshtastic short name. Currently the only
-// supported verb is STATUS → re-emit the same frame we send on boot.
+// State transitions shared by the mesh dispatcher and the local `watch` REPL
+// command. AT+BREAK halts any pending invoke on the WE-2 (idempotent); the
+// watch_enabled flag gates watch_tick() in loop().
+static void arm_camera(const char *source) {
+  watch_enabled = true;
+  last_invoke_ms = 0;                       // fire next tick immediately
+  for (uint32_t &t : last_fired_ms) t = 0;  // reset per-class debounce
+  send_at("BREAK"); drain_responses(200);
+  Serial.printf("camera: ARMED (%s)\n", source);
+}
+
+static void disarm_camera(const char *source) {
+  watch_enabled = false;
+  send_at("BREAK"); drain_responses(200);
+  Serial.printf("camera: DISARMED (%s)\n", source);
+}
+
+// Inbound text dispatcher. Targets matched case-insensitively against "ALL",
+// "CAM", and our discovered Meshtastic short name. Global verbs handled here:
+// STATUS, START, STOP. Cam-specific verbs come later.
 static void on_mesh_text(const char *text, uint32_t from) {
   Serial.printf("mesh-rx: from=%08x text='%s'\n", (unsigned)from, text);
   if (text[0] != '@') return;
@@ -268,6 +287,16 @@ static void on_mesh_text(const char *text, uint32_t from) {
 
   if (strcasecmp(verb, "STATUS") == 0) {
     Serial.printf("mesh-rx: @%s STATUS -> responding\n", target);
+    send_status_frame();
+  } else if (strcasecmp(verb, "START") == 0) {
+    Serial.printf("mesh-rx: @%s START -> arming\n", target);
+    arm_camera("mesh");
+    mesh.send_text("Cam: START_ACK:OK");
+    send_status_frame();
+  } else if (strcasecmp(verb, "STOP") == 0) {
+    Serial.printf("mesh-rx: @%s STOP -> disarming\n", target);
+    disarm_camera("mesh");
+    mesh.send_text("Cam: STOP_ACK:OK");
     send_status_frame();
   } else {
     Serial.printf("mesh-rx: @%s %s -> unknown verb (ignored)\n", target, verb);
@@ -506,16 +535,13 @@ void loop() {
       else if (cmd == "reset")                  send_at("RST");
       else if (cmd == "watch") {
         if (arg.equalsIgnoreCase("on") || arg == "1") {
-          watch_enabled = true;
-          last_invoke_ms = 0;   // fire immediately
-          for (uint32_t &t : last_fired_ms) t = 0;
+          arm_camera("repl");
           Serial.printf("watch: ON (threshold=%u, cooldown=%lums, every %lums)\n",
                         (unsigned)kForwardScoreThreshold,
                         (unsigned long)kPerClassCooldownMs,
                         (unsigned long)kInvokePeriodMs);
         } else if (arg.equalsIgnoreCase("off") || arg == "0") {
-          watch_enabled = false;
-          Serial.println("watch: OFF");
+          disarm_camera("repl");
         } else {
           Serial.printf("watch: %s — usage: watch on|off\n",
                         watch_enabled ? "ON" : "OFF");
