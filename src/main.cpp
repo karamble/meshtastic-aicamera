@@ -76,6 +76,28 @@ static void store_hb_interval(uint8_t m) {
   }
 }
 
+// ---- NVS-backed active model slot -----------------------------------------
+// Persists the operator's last MODEL_SET / `bind` / `model` choice so the
+// camera comes back up on the same slot rather than always defaulting to 1.
+static const char    *kCurSlotPrefsKey = "cur_slot";
+static const uint8_t  kCurSlotDefault  = 1;
+
+static uint8_t load_active_slot() {
+  Preferences prefs;
+  prefs.begin(kBlePrefsNamespace, /*readOnly=*/true);
+  uint8_t s = prefs.getUChar(kCurSlotPrefsKey, kCurSlotDefault);
+  prefs.end();
+  return s ? s : kCurSlotDefault;
+}
+
+static void store_active_slot(uint8_t id) {
+  Preferences prefs;
+  if (prefs.begin(kBlePrefsNamespace, /*readOnly=*/false)) {
+    prefs.putUChar(kCurSlotPrefsKey, id);
+    prefs.end();
+  }
+}
+
 // ---- COCO class labels (indices 0..79), fallback for slots without NVS data
 static const char *const COCO[80] = {
   "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
@@ -325,6 +347,22 @@ static void disarm_camera(const char *source) {
   Serial.printf("camera: DISARMED (%s)\n", source);
 }
 
+// Bind a WE-2 model slot. Issues AT+MODEL=<id> + AT+ALGO=0, updates the
+// runtime cursor, resets per-class debounce, and persists the choice to NVS.
+// Returns false if `id` is not in g_slots (caller decides how to surface it).
+static bool bind_slot(int id, const char *source) {
+  if (!slot_by_id(id)) return false;
+  send_at("MODEL=" + String(id));
+  drain_responses(400);
+  send_at("ALGO=0");
+  drain_responses(200);
+  g_current_slot = id;
+  for (uint32_t &t : last_fired_ms) t = 0;
+  store_active_slot((uint8_t)id);
+  Serial.printf("model: bound slot %d (%s)\n", id, source);
+  return true;
+}
+
 // Inbound text dispatcher. Targets matched case-insensitively against "ALL",
 // "CAM", and our discovered Meshtastic short name. Global verbs handled here:
 // STATUS, START, STOP. Cam-specific verbs come later.
@@ -405,6 +443,17 @@ static void on_mesh_text(const char *text, uint32_t from) {
   } else if (strcasecmp(verb, "MODEL_LIST") == 0) {
     Serial.printf("mesh-rx: @%s MODEL_LIST -> responding\n", target);
     send_model_list();
+  } else if (strcasecmp(verb, "MODEL_SET") == 0) {
+    int id = vparam[0] ? atoi(vparam) : 0;
+    if (id <= 0 || !bind_slot(id, "mesh")) {
+      mesh.send_text("Cam: MODEL_SET_ACK:ERROR");
+      Serial.printf("mesh-rx: @%s MODEL_SET:'%s' -> unknown slot (ERROR)\n",
+                    target, vparam);
+    } else {
+      mesh.send_text("Cam: MODEL_SET_ACK:OK");
+      send_status_frame();
+      Serial.printf("mesh-rx: @%s MODEL_SET:%d -> OK\n", target, id);
+    }
   } else {
     Serial.printf("mesh-rx: @%s %s -> unknown verb (ignored)\n", target, verb);
   }
@@ -441,17 +490,12 @@ static void print_help() {
 
 // ---- setup / loop ---------------------------------------------------------
 
-// Bind slot 1 and re-arm algorithm auto-detect on boot. Persists in the
-// WE-2 across reboots; the C3 issues these idempotently each cold start.
+// Bind the operator's last chosen slot (from NVS) and re-arm algorithm
+// auto-detect on boot. Idempotent — the C3 issues these each cold start.
+// Falls back to slot 1 if NVS holds a slot id that's no longer in g_slots.
 static void auto_configure() {
-  AI.write("AT+MODEL=1\r\n", 12);
-  delay(300);
-  drain_responses(400);
-  AI.write("AT+ALGO=0\r\n", 11);
-  delay(200);
-  drain_responses(400);
-  g_current_slot = 1;
-  for (uint32_t &t : last_fired_ms) t = 0;
+  uint8_t s = load_active_slot();
+  if (!bind_slot(s, "boot")) bind_slot(1, "boot-fallback");
 }
 
 void setup() {
@@ -567,13 +611,8 @@ void loop() {
       else if (cmd == "current")                send_at("MODEL?");
       else if (cmd == "bind") {
         if (!arg.length()) Serial.println("usage: bind <id>");
-        else {
-          int id = arg.toInt();
-          send_at("MODEL=" + arg);
-          drain_responses(400);
-          send_at("ALGO=0");
-          g_current_slot = id;
-          for (uint32_t &t : last_fired_ms) t = 0;
+        else if (!bind_slot(arg.toInt(), "repl bind")) {
+          Serial.printf("unknown slot id '%s'; type `model` for the list\n", arg.c_str());
         }
       }
       else if (cmd == "model") {
@@ -583,11 +622,7 @@ void loop() {
             Serial.printf("unknown model alias '%s'; type `model` for the list\n", arg.c_str());
           } else {
             Serial.printf("binding model %d (%s)\n", s->id, s->alias.c_str());
-            send_at("MODEL=" + String(s->id));
-            drain_responses(400);
-            send_at("ALGO=0");
-            g_current_slot = s->id;
-            for (uint32_t &t : last_fired_ms) t = 0;
+            bind_slot(s->id, "repl model");
           }
         } else {
           Serial.println("model aliases (from NVS or defaults):");
