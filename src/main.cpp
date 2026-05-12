@@ -344,12 +344,13 @@ static bool send_status_frame() {
   const GroveSlot *cur = slot_by_id(g_current_slot);
   const char *alias = cur ? cur->alias.c_str() : "?";
   const char *mode  = watch_enabled ? "ARMED" : "DISARMED";
+  const char *wifi  = webui.is_on() ? "ON" : "OFF";
 
-  char buf[128];
+  char buf[160];
   snprintf(buf, sizeof(buf),
     "Cam: STATUS: Mode:%s Scan:CAM Hits:0 Temp:0.0C "
-    "Up:%02u:%02u:%02u Type:AICAMERA Slots:%u Model:%s",
-    mode, h, m, sec, (unsigned)g_slots.size(), alias);
+    "Up:%02u:%02u:%02u Type:AICAMERA Slots:%u Model:%s Wifi:%s",
+    mode, h, m, sec, (unsigned)g_slots.size(), alias, wifi);
 
   bool ok = mesh.send_text(buf);
   Serial.printf("mesh: STATUS %s (%s)\n", ok ? "queued" : "DROPPED", buf);

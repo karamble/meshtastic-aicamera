@@ -125,7 +125,7 @@ Every reply starts with `Cam: ` so the dashboard can filter responses.
 
 | Verb | Reply | Notes |
 |---|---|---|
-| `@CAM STATUS` | `Cam: STATUS: Mode:<ARMED\|DISARMED> Scan:CAM Hits:0 Temp:0.0C Up:<HH:MM:SS> Type:AICAMERA Slots:<N> Model:<alias>` | One-shot snapshot. Same shape as the boot frame and the periodic heartbeat. |
+| `@CAM STATUS` | `Cam: STATUS: Mode:<ARMED\|DISARMED> Scan:CAM Hits:0 Temp:0.0C Up:<HH:MM:SS> Type:AICAMERA Slots:<N> Model:<alias> Wifi:<ON\|OFF>` | One-shot snapshot. Same shape as the boot frame and the periodic heartbeat. |
 | `@CAM START` | `Cam: START_ACK:OK` + STATUS | Arms the watch loop. Forwards detections to the mesh. |
 | `@CAM STOP` | `Cam: STOP_ACK:OK` + STATUS | Disarms. The bridge stays connected but emits nothing. |
 
