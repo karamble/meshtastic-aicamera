@@ -155,8 +155,8 @@ Every reply starts with `Cam: ` so the dashboard can filter responses.
 
 | Verb | Reply | Notes |
 |---|---|---|
-| `@CAM WIFI_ON` | `Cam: WIFI_ACK:OK` / `Cam: WIFI_ACK:ERROR` | Brings up the softAP at `192.168.4.1`. Persisted. |
-| `@CAM WIFI_OFF` | `Cam: WIFI_ACK:OK` | Brings the AP down. Persisted. |
+| `@CAM WIFI_ON` | `Cam: WIFI_ON_ACK:OK` / `Cam: WIFI_ON_ACK:ERROR` | Brings up the softAP at `192.168.4.1`. Persisted. |
+| `@CAM WIFI_OFF` | `Cam: WIFI_OFF_ACK:OK` | Brings the AP down. Persisted. |
 | `@CAM WIFI_SSID:<name>` | `Cam: WIFI_SSID_ACK:OK` / `Cam: WIFI_SSID_ACK:ERROR` | Set the softAP SSID (1..32 chars). Persisted. Takes effect on next `WIFI_OFF` &rarr; `WIFI_ON`. |
 | `@CAM WIFI_PSK:<pass>` | `Cam: WIFI_PSK_ACK:OK` / `Cam: WIFI_PSK_ACK:ERROR` | Set the WPA2 PSK (8..63 chars). Persisted. Takes effect on next `WIFI_OFF` &rarr; `WIFI_ON`. |
 
@@ -173,7 +173,7 @@ When the bridge brings up its Wi-Fi softAP, a phone or laptop in range can join 
 From a Meshtastic peer (or diginode-cc):
 
 ```
-@CAM WIFI_ON           → Cam: WIFI_ACK:OK
+@CAM WIFI_ON           → Cam: WIFI_ON_ACK:OK
 ```
 
 Or from the bench REPL:
@@ -213,7 +213,7 @@ Every form does a POST and is redirected back to `/`, so the page always shows t
 ### Turning it off
 
 ```
-@CAM WIFI_OFF          → Cam: WIFI_ACK:OK
+@CAM WIFI_OFF          → Cam: WIFI_OFF_ACK:OK
 ```
 
 or `wifi off` at the REPL. The AP shuts down and the off-state is persisted; the next boot will not bring the AP back up until `WIFI_ON` is sent again.

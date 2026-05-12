@@ -608,11 +608,11 @@ static void on_mesh_text(const char *text, uint32_t from) {
     }
   } else if (strcasecmp(verb, "WIFI_ON") == 0) {
     bool ok = webui.turn_on();
-    mesh.send_text(ok ? "Cam: WIFI_ACK:OK" : "Cam: WIFI_ACK:ERROR");
+    mesh.send_text(ok ? "Cam: WIFI_ON_ACK:OK" : "Cam: WIFI_ON_ACK:ERROR");
     Serial.printf("wifi: %s [mesh]\n", ok ? "ON" : "FAIL");
   } else if (strcasecmp(verb, "WIFI_OFF") == 0) {
     webui.turn_off();
-    mesh.send_text("Cam: WIFI_ACK:OK");
+    mesh.send_text("Cam: WIFI_OFF_ACK:OK");
     Serial.println("wifi: OFF [mesh]");
   } else if (strcasecmp(verb, "WIFI_SSID") == 0) {
     if (webui.set_ssid(String(vparam))) {
