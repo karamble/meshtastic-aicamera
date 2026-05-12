@@ -35,6 +35,47 @@ static bool store_ble_pin(uint32_t pin) {
   return n == sizeof(uint32_t);
 }
 
+// ---- NVS-backed heartbeat config ------------------------------------------
+// Family contract (matches gatesensor/halberd): operator addresses the camera
+// with @<target> HB_ON / HB_OFF / HB_INTERVAL:<n>. Interval is in MINUTES,
+// bounded [1,60] across all sibling firmwares. Defaults to enabled, 30 min.
+static const char    *kHbEnPrefsKey   = "hb_en";
+static const char    *kHbMinPrefsKey  = "hb_min";
+static const uint8_t  kHbMinDefault   = 30;
+static const uint8_t  kHbMinMin       = 1;
+static const uint8_t  kHbMinMax       = 60;
+
+static bool     hb_enabled      = true;
+static uint8_t  hb_interval_min = kHbMinDefault;
+static uint32_t hb_last_send_ms = 0;
+
+static void load_hb_config() {
+  Preferences prefs;
+  prefs.begin(kBlePrefsNamespace, /*readOnly=*/true);
+  hb_enabled      = prefs.getBool (kHbEnPrefsKey,  true);
+  hb_interval_min = prefs.getUChar(kHbMinPrefsKey, kHbMinDefault);
+  prefs.end();
+  if (hb_interval_min < kHbMinMin || hb_interval_min > kHbMinMax) {
+    hb_interval_min = kHbMinDefault;
+  }
+}
+
+static void store_hb_enabled(bool en) {
+  Preferences prefs;
+  if (prefs.begin(kBlePrefsNamespace, /*readOnly=*/false)) {
+    prefs.putBool(kHbEnPrefsKey, en);
+    prefs.end();
+  }
+}
+
+static void store_hb_interval(uint8_t m) {
+  Preferences prefs;
+  if (prefs.begin(kBlePrefsNamespace, /*readOnly=*/false)) {
+    prefs.putUChar(kHbMinPrefsKey, m);
+    prefs.end();
+  }
+}
+
 // ---- COCO class labels (indices 0..79), fallback for slots without NVS data
 static const char *const COCO[80] = {
   "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
@@ -281,9 +322,19 @@ static void on_mesh_text(const char *text, uint32_t from) {
 
   const char *v = sp + 1;
   while (*v == ' ') ++v;
-  char verb[16] = {0};
+  char verb[24]   = {0};
+  char vparam[16] = {0};
   size_t i = 0;
-  while (v[i] && v[i] != ' ' && i < sizeof(verb) - 1) { verb[i] = v[i]; ++i; }
+  while (v[i] && v[i] != ' ' && v[i] != ':' && i < sizeof(verb) - 1) {
+    verb[i] = v[i]; ++i;
+  }
+  if (v[i] == ':') {
+    ++i;
+    size_t j = 0;
+    while (v[i] && v[i] != ' ' && j < sizeof(vparam) - 1) {
+      vparam[j++] = v[i++];
+    }
+  }
 
   if (strcasecmp(verb, "STATUS") == 0) {
     Serial.printf("mesh-rx: @%s STATUS -> responding\n", target);
@@ -298,6 +349,31 @@ static void on_mesh_text(const char *text, uint32_t from) {
     disarm_camera("mesh");
     mesh.send_text("Cam: STOP_ACK:OK");
     send_status_frame();
+  } else if (strcasecmp(verb, "HB_ON") == 0) {
+    hb_enabled = true;
+    hb_last_send_ms = millis();
+    store_hb_enabled(true);
+    mesh.send_text("Cam: HB_ACK:OK");
+    Serial.printf("hb: enabled (interval=%umin) [mesh]\n",
+                  (unsigned)hb_interval_min);
+  } else if (strcasecmp(verb, "HB_OFF") == 0) {
+    hb_enabled = false;
+    store_hb_enabled(false);
+    mesh.send_text("Cam: HB_ACK:OK");
+    Serial.println("hb: disabled [mesh]");
+  } else if (strcasecmp(verb, "HB_INTERVAL") == 0) {
+    int m = vparam[0] ? atoi(vparam) : 0;
+    if (m < kHbMinMin || m > kHbMinMax) {
+      mesh.send_text("Cam: HB_ACK:ERROR");
+      Serial.printf("hb: bad interval '%s' (must be %u..%u) [mesh]\n",
+                    vparam, kHbMinMin, kHbMinMax);
+    } else {
+      hb_interval_min = (uint8_t)m;
+      hb_last_send_ms = millis();
+      store_hb_interval(hb_interval_min);
+      mesh.send_text("Cam: HB_ACK:OK");
+      Serial.printf("hb: interval=%umin [mesh]\n", (unsigned)hb_interval_min);
+    }
   } else {
     Serial.printf("mesh-rx: @%s %s -> unknown verb (ignored)\n", target, verb);
   }
@@ -320,6 +396,7 @@ static void print_help() {
     "  reset              AT+RST       (soft-reset the WE-2)\n"
     "  raw <text>         send 'AT+<text>\\r\\n' verbatim\n"
     "  watch on|off       continuous-invoke + forward detections to mesh\n"
+    "  hb [on|off|<n>]    heartbeat status / toggle / set interval (minutes, 1..60)\n"
     "  mesh-status        show BLE state (scanning/pairing/ready/...)\n"
     "  mesh-test <text>   broadcast a one-off text over the mesh\n"
     "  whoami             print the discovered Meshtastic short/long name + num\n"
@@ -369,6 +446,10 @@ void setup() {
                   ? " (defaults, no NVS override)"
                   : " (from NVS)");
 
+  load_hb_config();
+  Serial.printf("heartbeat: %s, interval=%umin\n",
+                hb_enabled ? "ON" : "OFF", (unsigned)hb_interval_min);
+
   bool ok = AI.begin();
   Serial.printf("AI.begin -> %s\n", ok ? "OK" : "FAIL");
   if (ok) {
@@ -415,7 +496,15 @@ static void watch_tick() {
 void loop() {
   mesh.loop();           // BLE state machine
   if (!sent_armed && mesh.is_connected()) {
-    if (send_status_frame()) sent_armed = true;
+    if (send_status_frame()) {
+      sent_armed = true;
+      hb_last_send_ms = millis();   // anchor periodic cadence to boot STATUS
+    }
+  }
+  if (sent_armed && hb_enabled &&
+      (millis() - hb_last_send_ms) >= (uint32_t)hb_interval_min * 60000UL) {
+    hb_last_send_ms = millis();
+    send_status_frame();
   }
   drain_responses(0);    // SSCMA spontaneous events
   if (watch_enabled && (millis() - last_invoke_ms) >= kInvokePeriodMs) {
@@ -545,6 +634,40 @@ void loop() {
         } else {
           Serial.printf("watch: %s — usage: watch on|off\n",
                         watch_enabled ? "ON" : "OFF");
+        }
+      }
+      else if (cmd == "hb") {
+        if (arg.length() == 0) {
+          uint32_t elapsed_ms = millis() - hb_last_send_ms;
+          uint32_t period_ms  = (uint32_t)hb_interval_min * 60000UL;
+          uint32_t next_in_s  = (hb_enabled && period_ms > elapsed_ms)
+                                  ? (period_ms - elapsed_ms) / 1000UL : 0UL;
+          Serial.printf("hb: %s, interval=%umin, next in %lus\n",
+                        hb_enabled ? "ON" : "OFF",
+                        (unsigned)hb_interval_min,
+                        (unsigned long)next_in_s);
+        } else if (arg.equalsIgnoreCase("on")) {
+          hb_enabled = true;
+          hb_last_send_ms = millis();
+          store_hb_enabled(true);
+          Serial.printf("hb: enabled (interval=%umin) [repl]\n",
+                        (unsigned)hb_interval_min);
+        } else if (arg.equalsIgnoreCase("off")) {
+          hb_enabled = false;
+          store_hb_enabled(false);
+          Serial.println("hb: disabled [repl]");
+        } else {
+          int m = arg.toInt();
+          if (m < kHbMinMin || m > kHbMinMax) {
+            Serial.printf("hb: bad interval (must be %u..%u)\n",
+                          kHbMinMin, kHbMinMax);
+          } else {
+            hb_interval_min = (uint8_t)m;
+            hb_last_send_ms = millis();
+            store_hb_interval(hb_interval_min);
+            Serial.printf("hb: interval=%umin [repl]\n",
+                          (unsigned)hb_interval_min);
+          }
         }
       }
       else if (cmd == "mesh-status") {
