@@ -210,6 +210,33 @@ static String class_label_for(int slot_id, int class_idx) {
   return String(coco_name(class_idx));
 }
 
+// Boot-time STATUS frame, latched in loop() after BLE handshake completes.
+// Format matches diginode-cc's parser (Mode/Scan/Hits/Temp/Up are required
+// in this order); Type/Slots/Model are camera-specific tail tokens the
+// regex ignores. Mirrors the gatesensor sibling's ARMED frame.
+static bool sent_armed = false;
+
+static void send_armed_status() {
+  uint32_t s_total = millis() / 1000UL;
+  unsigned h   = (unsigned)(s_total / 3600UL);
+  unsigned m   = (unsigned)((s_total / 60UL) % 60UL);
+  unsigned sec = (unsigned)(s_total % 60UL);
+
+  const GroveSlot *cur = slot_by_id(g_current_slot);
+  const char *alias = cur ? cur->alias.c_str() : "?";
+
+  char buf[128];
+  snprintf(buf, sizeof(buf),
+    "Cam: STATUS: Mode:ARMED Scan:CAM Hits:0 Temp:0.0C "
+    "Up:%02u:%02u:%02u Type:AICAMERA Slots:%u Model:%s",
+    h, m, sec, (unsigned)g_slots.size(), alias);
+
+  if (mesh.send_text(buf)) {
+    sent_armed = true;
+    Serial.printf("mesh: ARMED queued (%s)\n", buf);
+  }
+}
+
 static void print_help() {
   Serial.println(
     "\n--- ai-cam-bridge interactive ---\n"
@@ -319,6 +346,7 @@ static void watch_tick() {
 
 void loop() {
   mesh.loop();           // BLE state machine
+  if (!sent_armed && mesh.is_connected()) send_armed_status();
   drain_responses(0);    // SSCMA spontaneous events
   if (watch_enabled && (millis() - last_invoke_ms) >= kInvokePeriodMs) {
     last_invoke_ms = millis();

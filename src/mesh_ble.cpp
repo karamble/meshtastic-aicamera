@@ -418,12 +418,6 @@ void MeshBLE::loop() {
       _handshake_complete = true;
       log_i("mesh: handshake complete after %lums",
             (unsigned long)(millis() - _handshake_sent_at));
-      if (!_sent_hello) {
-        _sent_hello = true;
-        const char *hello = "@CAM bridge online";
-        bool ok = send_text(hello);
-        log_i("mesh: hello send_text -> %s", ok ? "queued" : "FAILED");
-      }
     }
     break;
 

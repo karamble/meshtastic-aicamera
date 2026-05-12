@@ -57,9 +57,6 @@ private:
   uint32_t _handshake_sent_at  = 0;
   bool     _handshake_complete = false;
 
-  // Latched after the first READY; gates the one-time "@CAM bridge online".
-  bool _sent_hello = false;
-
   static size_t encode_text_to_radio(const char *text,
                                      uint8_t    *out,
                                      size_t      out_max);
