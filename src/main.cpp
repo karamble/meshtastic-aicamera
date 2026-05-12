@@ -98,6 +98,32 @@ static void store_active_slot(uint8_t id) {
   }
 }
 
+// ---- NVS-backed per-class dedup interval ----------------------------------
+// Wire verb DEDUP_INTERVAL:<sec> bounded [1, 3600]. Default 30 s — cuts the
+// mesh-flood of a person standing in frame down to one frame every half-minute.
+// Per-class: each COCO index has its own timer in last_fired_ms[80].
+static const char    *kDedupSecPrefsKey = "dedup_sec";
+static const uint16_t kDedupSecDefault  = 30;
+static const uint16_t kDedupSecMin      = 1;
+static const uint16_t kDedupSecMax      = 3600;
+
+static uint16_t load_dedup_sec() {
+  Preferences prefs;
+  prefs.begin(kBlePrefsNamespace, /*readOnly=*/true);
+  uint16_t s = prefs.getUShort(kDedupSecPrefsKey, kDedupSecDefault);
+  prefs.end();
+  if (s < kDedupSecMin || s > kDedupSecMax) s = kDedupSecDefault;
+  return s;
+}
+
+static void store_dedup_sec(uint16_t s) {
+  Preferences prefs;
+  if (prefs.begin(kBlePrefsNamespace, /*readOnly=*/false)) {
+    prefs.putUShort(kDedupSecPrefsKey, s);
+    prefs.end();
+  }
+}
+
 // ---- COCO class labels (indices 0..79), fallback for slots without NVS data
 static const char *const COCO[80] = {
   "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
@@ -125,7 +151,7 @@ static bool          watch_enabled         = true;
 static uint32_t      last_invoke_ms        = 0;
 static const uint32_t kInvokePeriodMs      = 250;     // 4 Hz
 static const uint8_t  kForwardScoreThreshold = 50;    // 0–100
-static const uint32_t kPerClassCooldownMs  = 5000;
+static uint32_t cooldown_ms = (uint32_t)kDedupSecDefault * 1000UL;  // overwritten from NVS in setup()
 static uint32_t      last_fired_ms[80]     = {0};
 
 // ---- helpers --------------------------------------------------------------
@@ -454,6 +480,19 @@ static void on_mesh_text(const char *text, uint32_t from) {
       send_status_frame();
       Serial.printf("mesh-rx: @%s MODEL_SET:%d -> OK\n", target, id);
     }
+  } else if (strcasecmp(verb, "DEDUP_INTERVAL") == 0) {
+    int s = vparam[0] ? atoi(vparam) : 0;
+    if (s < kDedupSecMin || s > kDedupSecMax) {
+      mesh.send_text("Cam: DEDUP_ACK:ERROR");
+      Serial.printf("dedup: bad interval '%s' (must be %u..%u) [mesh]\n",
+                    vparam, kDedupSecMin, kDedupSecMax);
+    } else {
+      cooldown_ms = (uint32_t)s * 1000UL;
+      store_dedup_sec((uint16_t)s);
+      for (uint32_t &t : last_fired_ms) t = 0;
+      mesh.send_text("Cam: DEDUP_ACK:OK");
+      Serial.printf("dedup: interval=%us [mesh]\n", (unsigned)s);
+    }
   } else {
     Serial.printf("mesh-rx: @%s %s -> unknown verb (ignored)\n", target, verb);
   }
@@ -525,6 +564,10 @@ void setup() {
   Serial.printf("heartbeat: %s, interval=%umin\n",
                 hb_enabled ? "ON" : "OFF", (unsigned)hb_interval_min);
 
+  uint16_t dedup_sec = load_dedup_sec();
+  cooldown_ms = (uint32_t)dedup_sec * 1000UL;
+  Serial.printf("dedup: interval=%us (from NVS or default)\n", (unsigned)dedup_sec);
+
   bool ok = AI.begin();
   Serial.printf("AI.begin -> %s\n", ok ? "OK" : "FAIL");
   if (ok) {
@@ -554,7 +597,7 @@ static void watch_tick() {
     if (b.score < kForwardScoreThreshold) continue;
     if (b.target >= 80) continue;
     uint32_t since = now - last_fired_ms[b.target];
-    if (last_fired_ms[b.target] != 0 && since < kPerClassCooldownMs) continue;
+    if (last_fired_ms[b.target] != 0 && since < cooldown_ms) continue;
     last_fired_ms[b.target] = now ? now : 1;
 
     String label = class_label_for(g_current_slot, b.target);
@@ -693,7 +736,7 @@ void loop() {
           arm_camera("repl");
           Serial.printf("watch: ON (threshold=%u, cooldown=%lums, every %lums)\n",
                         (unsigned)kForwardScoreThreshold,
-                        (unsigned long)kPerClassCooldownMs,
+                        (unsigned long)cooldown_ms,
                         (unsigned long)kInvokePeriodMs);
         } else if (arg.equalsIgnoreCase("off") || arg == "0") {
           disarm_camera("repl");
