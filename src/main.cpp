@@ -124,6 +124,32 @@ static void store_dedup_sec(uint16_t s) {
   }
 }
 
+// ---- NVS-backed minimum detection confidence ------------------------------
+// Wire verb CONF_THRESHOLD:<n> bounded [1, 100]. Default 65 % — a field-tuned
+// floor for the YOLO-class models on the WE-2. Strict comparator: a score
+// equal to the threshold does NOT fire; only score > conf_min fires.
+static const char    *kConfMinPrefsKey = "conf_min";
+static const uint8_t  kConfMinDefault  = 65;
+static const uint8_t  kConfMinAbsMin   = 1;
+static const uint8_t  kConfMinAbsMax   = 100;
+
+static uint8_t load_conf_min() {
+  Preferences prefs;
+  prefs.begin(kBlePrefsNamespace, /*readOnly=*/true);
+  uint8_t v = prefs.getUChar(kConfMinPrefsKey, kConfMinDefault);
+  prefs.end();
+  if (v < kConfMinAbsMin || v > kConfMinAbsMax) v = kConfMinDefault;
+  return v;
+}
+
+static void store_conf_min(uint8_t v) {
+  Preferences prefs;
+  if (prefs.begin(kBlePrefsNamespace, /*readOnly=*/false)) {
+    prefs.putUChar(kConfMinPrefsKey, v);
+    prefs.end();
+  }
+}
+
 // ---- COCO class labels (indices 0..79), fallback for slots without NVS data
 static const char *const COCO[80] = {
   "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
@@ -150,7 +176,7 @@ static const char *coco_name(int idx) {
 static bool          watch_enabled         = true;
 static uint32_t      last_invoke_ms        = 0;
 static const uint32_t kInvokePeriodMs      = 250;     // 4 Hz
-static const uint8_t  kForwardScoreThreshold = 50;    // 0–100
+static uint8_t conf_min = kConfMinDefault;            // 1..100, overwritten from NVS in setup()
 static uint32_t cooldown_ms = (uint32_t)kDedupSecDefault * 1000UL;  // overwritten from NVS in setup()
 static uint32_t      last_fired_ms[80]     = {0};
 
@@ -493,6 +519,18 @@ static void on_mesh_text(const char *text, uint32_t from) {
       mesh.send_text("Cam: DEDUP_ACK:OK");
       Serial.printf("dedup: interval=%us [mesh]\n", (unsigned)s);
     }
+  } else if (strcasecmp(verb, "CONF_THRESHOLD") == 0) {
+    int v = vparam[0] ? atoi(vparam) : 0;
+    if (v < kConfMinAbsMin || v > kConfMinAbsMax) {
+      mesh.send_text("Cam: CONF_ACK:ERROR");
+      Serial.printf("conf: bad threshold '%s' (must be %u..%u) [mesh]\n",
+                    vparam, kConfMinAbsMin, kConfMinAbsMax);
+    } else {
+      conf_min = (uint8_t)v;
+      store_conf_min(conf_min);
+      mesh.send_text("Cam: CONF_ACK:OK");
+      Serial.printf("conf: threshold=%u [mesh]\n", (unsigned)conf_min);
+    }
   } else {
     Serial.printf("mesh-rx: @%s %s -> unknown verb (ignored)\n", target, verb);
   }
@@ -568,6 +606,9 @@ void setup() {
   cooldown_ms = (uint32_t)dedup_sec * 1000UL;
   Serial.printf("dedup: interval=%us (from NVS or default)\n", (unsigned)dedup_sec);
 
+  conf_min = load_conf_min();
+  Serial.printf("conf: threshold=%u (from NVS or default)\n", (unsigned)conf_min);
+
   bool ok = AI.begin();
   Serial.printf("AI.begin -> %s\n", ok ? "OK" : "FAIL");
   if (ok) {
@@ -594,7 +635,7 @@ static void watch_tick() {
 
   uint32_t now = millis();
   for (auto &b : dets) {
-    if (b.score < kForwardScoreThreshold) continue;
+    if (b.score <= conf_min) continue;
     if (b.target >= 80) continue;
     uint32_t since = now - last_fired_ms[b.target];
     if (last_fired_ms[b.target] != 0 && since < cooldown_ms) continue;
@@ -735,7 +776,7 @@ void loop() {
         if (arg.equalsIgnoreCase("on") || arg == "1") {
           arm_camera("repl");
           Serial.printf("watch: ON (threshold=%u, cooldown=%lums, every %lums)\n",
-                        (unsigned)kForwardScoreThreshold,
+                        (unsigned)conf_min,
                         (unsigned long)cooldown_ms,
                         (unsigned long)kInvokePeriodMs);
         } else if (arg.equalsIgnoreCase("off") || arg == "0") {
